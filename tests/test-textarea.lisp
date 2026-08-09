@@ -128,6 +128,65 @@
     (ta-key ta #\w +mod-ctrl+)
     (is (string= "foo bar " (tui.textarea:textarea-value ta)))))
 
+(test textarea-key-ctrl-arrows-move-word
+  "Ctrl+Right / Ctrl+Left move a word forward / backward."
+  (let ((ta (ta-make "alpha beta")))
+    (tui.textarea:textarea-focus ta)
+    (ta-set-cursor ta 0 0)
+    (ta-key ta :right +mod-ctrl+)
+    (is (equal '(0 6) (ta-cursor ta)))            ; start of "beta"
+    (ta-key ta :right +mod-ctrl+)
+    (is (equal '(0 10) (ta-cursor ta)))           ; end of "beta"
+    (ta-key ta :left +mod-ctrl+)
+    (is (equal '(0 6) (ta-cursor ta)))))          ; back to start of "beta"
+
+(test textarea-key-ctrl-backspace-deletes-word
+  "Ctrl+Backspace deletes the word before the cursor."
+  (let ((ta (ta-make "foo bar baz")))
+    (tui.textarea:textarea-focus ta)
+    (ta-set-cursor ta 0 11)
+    (ta-key ta :backspace +mod-ctrl+)
+    (is (string= "foo bar " (tui.textarea:textarea-value ta)))))
+
+(test textarea-key-ctrl-delete-deletes-word-forward
+  "Ctrl+Delete deletes the word after the cursor."
+  (let ((ta (ta-make "alpha beta")))
+    (tui.textarea:textarea-focus ta)
+    (ta-set-cursor ta 0 0)
+    (ta-key ta :delete +mod-ctrl+)
+    (is (string= "beta" (tui.textarea:textarea-value ta)))))
+
+;;; --- cursor line/column accessors (#875) ---
+
+(test textarea-line-and-column
+  "Line and Column return the zero-indexed cursor row and column."
+  (let ((ta (ta-make (format nil "aaa~%bbbb"))))
+    (ta-set-cursor ta 1 3)
+    (is (= 1 (tui.textarea:textarea-line ta)))
+    (is (= 3 (tui.textarea:textarea-column ta)))))
+
+;;; --- max-content-height (#910) ---
+
+(test textarea-max-content-height-blocks-newline
+  "With MAX-CONTENT-HEIGHT reached, Enter does not add a line."
+  (let ((ta (tui.textarea:make-textarea :max-content-height 2
+                                        :show-line-numbers nil)))
+    (tui.textarea:textarea-set-value ta (format nil "a~%b"))
+    (is (tui.textarea:textarea-at-content-limit-p ta))
+    (tui.textarea:textarea-focus ta)
+    (ta-key ta :enter)
+    (is (= 2 (tui.textarea:textarea-line-count ta)))))
+
+(test textarea-max-content-height-trims-insert
+  "An insert is trimmed so the content never exceeds MAX-CONTENT-HEIGHT rows."
+  (let ((ta (tui.textarea:make-textarea :max-content-height 3
+                                        :show-line-numbers nil)))
+    (tui.textarea:textarea-set-value ta "a")
+    (tui.textarea:textarea-move-to-end ta)
+    ;; Would add 3 more logical lines; only 2 rows of budget remain.
+    (tui.textarea:textarea-insert-string ta (format nil "~%b~%c~%d"))
+    (is (= 3 (tui.textarea:textarea-line-count ta)))))
+
 ;;; --- transpose & word case (readline niceties) ---
 
 (test textarea-transpose-at-end
@@ -271,26 +330,36 @@
 ;;; --- paging (#844) ---
 
 (test textarea-page-down-then-up
-  "Page-down moves by a viewport height and stays visible; page-up reverses."
+  "Page-down first snaps the cursor to the last visible line, then pages by a
+full viewport height; page-up reverses (snap to first visible line, then page)."
   (let ((ta (tui.textarea:make-textarea :height 3 :show-line-numbers nil)))
     (tui.textarea:textarea-set-value ta
                                      (format nil "l0~%l1~%l2~%l3~%l4~%l5~%l6"))
+    ;; First press snaps to the last visible line (row 2 with height 3).
     (tui.textarea:textarea-page-down ta)
-    (is (= 3 (tui.textarea::textarea-row ta)))
+    (is (= 2 (tui.textarea::textarea-row ta)))
     (tui.textarea::textarea-ensure-visible ta)
-    (is (= 1 (tui.textarea:textarea-scroll-position ta)))
+    (is (= 0 (tui.textarea:textarea-scroll-position ta)))
+    ;; Second press pages down by a full viewport height.
+    (tui.textarea:textarea-page-down ta)
+    (is (= 5 (tui.textarea::textarea-row ta)))
+    (tui.textarea::textarea-ensure-visible ta)
+    (is (= 3 (tui.textarea:textarea-scroll-position ta)))
+    ;; Page-up snaps back to the first visible line, then pages up.
+    (tui.textarea:textarea-page-up ta)
+    (is (= 3 (tui.textarea::textarea-row ta)))
     (tui.textarea:textarea-page-up ta)
     (is (= 0 (tui.textarea::textarea-row ta)))))
 
 (test textarea-key-page-down
-  "Page-down dispatched through update advances cursor and offset."
+  "Page-down dispatched through update snaps the cursor to the last visible line."
   (let ((ta (tui.textarea:make-textarea :height 3 :show-line-numbers nil)))
     (tui.textarea:textarea-set-value ta
                                      (format nil "l0~%l1~%l2~%l3~%l4~%l5~%l6"))
     (tui.textarea:textarea-focus ta)
     (ta-key ta :page-down)
-    (is (= 3 (tui.textarea::textarea-row ta)))
-    (is (= 1 (tui.textarea:textarea-scroll-position ta)))))
+    (is (= 2 (tui.textarea::textarea-row ta)))
+    (is (= 0 (tui.textarea:textarea-scroll-position ta)))))
 
 ;;; --- soft-wrapping ---
 

@@ -207,6 +207,124 @@
       (is (key-press-msg-p msg))
       (is (eq :up (key-event-code msg))))))
 
+;;; --- Kitty keyboard protocol (CSI u) ---
+
+(test read-key-kitty-plain
+  "read-key parses ESC [ 97 u as an 'a' press."
+  (let ((tuition::*input-stream*
+          (make-string-input-stream (format nil "~C[97u" #\Escape))))
+    (let ((msg (tuition::read-key)))
+      (is (key-press-msg-p msg))
+      (is (eql #\a (key-event-code msg))))))
+
+(test read-key-kitty-modifier-and-event
+  "ESC [ 97 ; 5:3 u decodes ctrl (mod 5) and release (event 3)."
+  (let ((tuition::*input-stream*
+          (make-string-input-stream (format nil "~C[97;5:3u" #\Escape))))
+    (let ((msg (tuition::read-key)))
+      (is (key-release-msg-p msg))
+      (is (eql #\a (key-event-code msg)))
+      (is (mod-contains (key-event-mod msg) +mod-ctrl+)))))
+
+(test read-key-kitty-modifier-press
+  "ESC [ 97 ; 5 u decodes ctrl and defaults to a press (event type 1)."
+  (let ((tuition::*input-stream*
+          (make-string-input-stream (format nil "~C[97;5u" #\Escape))))
+    (let ((msg (tuition::read-key)))
+      (is (key-press-msg-p msg))
+      (is (mod-contains (key-event-mod msg) +mod-ctrl+)))))
+
+(test read-key-kitty-shifted-alternate-key
+  "ESC [ 97:65 ; 2 u (flag 4) reads base key 'a' and exposes shifted 'A'."
+  (let ((tuition::*input-stream*
+          (make-string-input-stream (format nil "~C[97:65;2u" #\Escape))))
+    (let ((msg (tuition::read-key)))
+      (is (key-press-msg-p msg))
+      (is (eql #\a (key-event-code msg)))
+      (is (eql #\A (key-event-shifted-code msg)))
+      (is (null (key-event-base-code msg)))
+      (is (mod-contains (key-event-mod msg) +mod-shift+)))))
+
+(test read-key-kitty-shifted-and-base-alternate-keys
+  "ESC [ 97:65:113 ; 1 u exposes both the shifted and base-layout keys."
+  (let ((tuition::*input-stream*
+          (make-string-input-stream (format nil "~C[97:65:113;1u" #\Escape))))
+    (let ((msg (tuition::read-key)))
+      (is (eql #\a (key-event-code msg)))
+      (is (eql #\A (key-event-shifted-code msg)))
+      (is (eql #\q (key-event-base-code msg))))))       ; 113 = q (e.g. AZERTY base)
+
+(test read-key-kitty-no-alternate-keys
+  "A plain Kitty sequence leaves shifted/base codes NIL."
+  (let ((tuition::*input-stream*
+          (make-string-input-stream (format nil "~C[97;5u" #\Escape))))
+    (let ((msg (tuition::read-key)))
+      (is (null (key-event-shifted-code msg)))
+      (is (null (key-event-base-code msg))))))
+
+(test read-key-kitty-associated-text
+  "ESC [ 97 ; 1 ; 233 u (flag 16) uses the associated text codepoint."
+  (let ((tuition::*input-stream*
+          (make-string-input-stream (format nil "~C[97;1;233u" #\Escape))))
+    (let ((msg (tuition::read-key)))
+      (is (key-press-msg-p msg))
+      (is (string= (string (code-char 233)) (key-event-text msg))))))
+
+(test kitty-enhancement-flags-emitted
+  "Requesting all keyboard enhancements pushes flags 1|2|4|8|16 = 31."
+  (let* ((vs (tuition:make-view "x"
+                                :keyboard-enhancements
+                                '(:report-event-types t
+                                  :report-alternate-keys t
+                                  :report-all-keys-as-escapes t
+                                  :report-associated-text t)))
+         (out (with-output-to-string (s)
+                (tuition::apply-terminal-transitions nil nil vs s))))
+    (is (search (format nil "~C[>31u" #\Escape) out))))
+
+(test kitty-enhancement-flags-default-disambiguate-only
+  "With no options, only the disambiguate flag (1) is pushed."
+  (let* ((vs (tuition:make-view "x" :keyboard-enhancements '(:enabled t)))
+         (out (with-output-to-string (s)
+                (tuition::apply-terminal-transitions nil nil vs s))))
+    (is (search (format nil "~C[>1u" #\Escape) out))))
+
+;;; --- Terminal progress bar (OSC 9;4) ---
+
+(defun %pb-transition (prev cur)
+  "Return the escape output emitted transitioning progress bar PREV -> CUR."
+  (with-output-to-string (s)
+    (tuition::apply-terminal-transitions
+     nil
+     (and prev (tuition:make-view "x" :progress-bar prev))
+     (tuition:make-view "x" :progress-bar cur)
+     s)))
+
+(test progress-bar-default-sets-percentage
+  "A default progress bar emits OSC 9;4;1;<value>."
+  (is (search (format nil "~C]9;4;1;42~C" (code-char 27) (code-char 7))
+              (%pb-transition nil (tuition:make-progress-bar :state :default :value 42)))))
+
+(test progress-bar-indeterminate
+  "An indeterminate progress bar emits OSC 9;4;3 with no value."
+  (is (search (format nil "~C]9;4;3~C" (code-char 27) (code-char 7))
+              (%pb-transition nil (tuition:make-progress-bar :state :indeterminate)))))
+
+(test progress-bar-clamps-value
+  "Values above 100 are clamped."
+  (is (search (format nil "~C]9;4;2;100~C" (code-char 27) (code-char 7))
+              (%pb-transition nil (tuition:make-progress-bar :state :error :value 250)))))
+
+(test progress-bar-removal-resets
+  "Removing the progress bar (NIL) emits the reset sequence OSC 9;4;0."
+  (is (search (format nil "~C]9;4;0~C" (code-char 27) (code-char 7))
+              (%pb-transition (tuition:make-progress-bar :state :default :value 10) nil))))
+
+(test progress-bar-unchanged-emits-nothing
+  "An unchanged progress bar emits no escape sequence."
+  (let ((pb (tuition:make-progress-bar :state :default :value 10)))
+    (is (string= "" (%pb-transition pb pb)))))
+
 ;;; --- key-string ---
 
 (test key-string-char

@@ -29,7 +29,7 @@ Tuition handles terminal concerns for you (raw mode, alternate screen, input dec
 - Commands: Functions that return messages asynchronously, enabling timers, I/O, and background work without blocking.
 - Program: A managed loop that sets up the terminal, processes messages, runs commands, and refreshes the screen.
 - Pure Rendering: Rendering returns strings; styling, layout, borders, and reflow are composition-friendly utilities.
-- Components: Reusable widgets (spinner, progress, list, table, text input) that manage their own state and view.
+- Components: Reusable widgets (spinner, progress, list, table, text input, textarea, viewport, paginator, stopwatch, timer, help, datepicker) that manage their own state and view.
 - Zones: Named regions to map mouse coordinates to stable identifiers for hover/click interactions.
 
 ## Features
@@ -46,7 +46,8 @@ Tuition handles terminal concerns for you (raw mode, alternate screen, input dec
 - Borders (normal, rounded, thick, double, block, ASCII, markdown) with title bars and drop shadows
 - Overlay compositing with transparent shadow effects
 - Reflow helpers (wrapping, truncation, ellipsizing, indentation)
-- Built-in components: spinner, progress bar, list, table, text input
+- Built-in components: spinner, progress bar, list (paginated + filterable), table (with width/height fitting and overflow), text input, textarea (soft-wrap, dynamic height), viewport (with soft-wrap), paginator, stopwatch, timer, help, datepicker
+- Native terminal (taskbar) progress bar via OSC 9;4
 - Zones for advanced mouse interactions (define and query named regions)
 
 ### Gallery
@@ -405,7 +406,9 @@ Use components when you want common interactions without re‑implementing state
   (tuition.components.progress:make-progress
     :percent 0.42 :colors (list "#5A56E0" "#EE6FF8")))
 
-;; List
+;; List (paginated; :height sets the page size). Also supports filtering
+;; (list-set-filter / list-reset-filter), page navigation (list-next-page /
+;; list-prev-page), list-go-to-start / list-go-to-end, and :infinite-scrolling.
 (let ((lst (tuition.components.list:make-list-view :items '("A" "B" "C"))))
   (tuition.components.list:list-view-render lst))
 
@@ -422,15 +425,31 @@ Use components when you want common interactions without re‑implementing state
     :rows '((1 "Alice in Wonderland") (2 "Bob"))
     :widths '(3 8)))
 
+;; Table with width/height fitting: columns expand or shrink to :width and
+;; rows are windowed to :height with an ellipsis overflow row.
+(tuition.render.table:table-render
+  (tuition.render.table:make-table
+    :headers '("ID" "Name")
+    :rows '((1 "Alice") (2 "Bob") (3 "Carol") (4 "Dave"))
+    :width 24 :height 5))
+
 ;; Text input
 (tuition.components.textinput:textinput-view
   (tuition.components.textinput:make-textinput :placeholder "Type here"))
 
-;; Textarea (multi-line; :soft-wrap and :dynamic-height are optional)
+;; Textarea (multi-line; :soft-wrap, :dynamic-height, and :max-content-height
+;; are optional). Word motion/deletion is bound to Ctrl+Left/Right and
+;; Ctrl+Backspace/Delete as well as the Alt-key readline bindings.
 (tuition.components.textarea:textarea-view
   (tuition.components.textarea:make-textarea
     :width 40 :height 6 :placeholder "Write a message..."
     :soft-wrap t :dynamic-height t))
+
+;; Viewport (scrollable region; :soft-wrap wraps long lines to the width)
+(let ((vp (tuition.components.viewport:make-viewport
+            :width 40 :height 10 :soft-wrap t
+            :content "A long block of text to scroll through...")))
+  (tuition.components.viewport:viewport-view vp))
 ```
 
 ## Zones (mouse areas)
@@ -462,7 +481,9 @@ By the way
 
 ## Error handling
 
-Tuition uses conditions for internal errors. You can customize reporting by rebinding `tui:*error-handler*`.
+Tuition uses conditions for internal errors. By default, caught errors are reported to `*error-output*` along with a backtrace. Setting the `TUITION_DEBUG` environment variable (or `tui:*panic-log-enabled*`) also writes a `tuition-panic-<timestamp>.log` trace file.
+
+You can customize reporting by rebinding `tui:*error-handler*`.
 
 ```lisp
 (let ((tui:*error-handler*

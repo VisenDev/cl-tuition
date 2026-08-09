@@ -342,6 +342,30 @@
 
     (t (values input nil))))
 
+(defun %ti-placeholder-view (input)
+  "Render the placeholder: truncate to WIDTH with an ellipsis when it is too
+long, pad to WIDTH with trailing spaces, overlay the cursor (reverse video) on
+the first cell when focused, and colour the whole thing in the placeholder
+style.  Mirrors bubbles' placeholderView."
+  (let* ((placeholder (textinput-placeholder input))
+         (width (max 1 (textinput-width input)))
+         (focused (textinput-focused input))
+         ;; Only ellipsize when the placeholder is genuinely wider than WIDTH.
+         (shown (if (<= (tuition:visible-length placeholder) width)
+                    placeholder
+                    (tuition:truncate-text placeholder width)))
+         (pad (max 0 (- width (tuition:visible-length shown))))
+         (padded (concatenate 'string shown (make-string pad :initial-element #\Space)))
+         (with-cursor (if (and focused (plusp (length padded)))
+                          (format nil "~C[7m~A~C[27m~A"
+                                  #\Escape (subseq padded 0 1) #\Escape (subseq padded 1))
+                          padded)))
+    (format nil "~A~A"
+            (textinput-prompt input)
+            (tuition:render-styled
+             (tuition:make-style :foreground tuition:*fg-bright-black*)
+             with-cursor))))
+
 (defun textinput-view (input)
   "Render the text input."
   (let* ((value (textinput-value input))
@@ -350,11 +374,12 @@
          (prompt (textinput-prompt input))
          (focused (textinput-focused input))
          (width (max 1 (textinput-width input)))
-         (is-placeholder (and (zerop (length value)) (not (zerop (length placeholder)))))
-         (base (if is-placeholder placeholder value))
+         (is-placeholder (and (zerop (length value)) (not (zerop (length placeholder))))))
+    (when is-placeholder
+      (return-from textinput-view (%ti-placeholder-view input)))
+    (let* ((base value)
          (masked (if (and (eq (textinput-echo-mode input) :password)
-                          (> (length base) 0)
-                          (not is-placeholder))  ; Don't mask placeholder
+                          (> (length base) 0))
                      (make-string (length base) :initial-element (textinput-echo-char input))
                      base))
          (clamped-cursor (min (length masked) cursor-pos))
@@ -376,13 +401,8 @@
                                                (subseq visible (1+ cursor-in-window))
                                                "")))
                             visible))
-         ;; Apply styling to final display (use bright-black/gray for placeholders)
-         (display (if is-placeholder
-                      (tuition:render-styled
-                       (tuition:make-style :foreground tuition:*fg-bright-black*)
-                       display-plain)
-                      display-plain)))
-    (format nil "~A~A" prompt display)))
+         (display display-plain))
+    (format nil "~A~A" prompt display))))
 
 ;;; Helper functions
 

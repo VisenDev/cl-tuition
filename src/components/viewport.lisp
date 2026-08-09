@@ -20,6 +20,7 @@
    #:viewport-y-offset
    #:viewport-x-offset
    #:viewport-content
+   #:viewport-soft-wrap
 
    ;; Operations
    #:viewport-init
@@ -45,7 +46,9 @@
 
    ;; Content
    #:viewport-set-content
+   #:viewport-set-content-lines
    #:viewport-total-lines
+   #:viewport-total-visual-lines
    #:viewport-visible-lines))
 
 (in-package #:tuition.components.viewport)
@@ -75,12 +78,18 @@
    (horizontal-step :initarg :horizontal-step
                     :accessor viewport-horizontal-step
                     :initform 4
-                    :documentation "Number of columns to scroll horizontally"))
+                    :documentation "Number of columns to scroll horizontally")
+   (soft-wrap :initarg :soft-wrap :accessor viewport-soft-wrap
+              :initform nil
+              :documentation "When true, content lines wider than WIDTH are
+soft-wrapped onto multiple visual lines and scrolling operates on those visual
+lines; horizontal scrolling is disabled."))
   (:documentation "A viewport for scrollable content."))
 
-(defun make-viewport (&key (width 80) (height 24) content)
+(defun make-viewport (&key (width 80) (height 24) content soft-wrap)
   "Create a new viewport with the given dimensions."
-  (let ((vp (make-instance 'viewport :width width :height height)))
+  (let ((vp (make-instance 'viewport :width width :height height
+                                     :soft-wrap soft-wrap)))
     (when content
       (viewport-set-content vp content))
     vp))
@@ -88,7 +97,7 @@
 ;;; Content management
 
 (defun viewport-set-content (viewport content)
-  "Set the viewport's content."
+  "Set the viewport's content from a string."
   (setf (viewport-lines viewport)
         (tuition:split-string-by-newline content))
   ;; Adjust offset if we're past the bottom
@@ -96,15 +105,41 @@
            (viewport-max-y-offset viewport))
     (viewport-goto-bottom viewport)))
 
+(defun viewport-set-content-lines (viewport lines)
+  "Set the viewport's content from a list of LINES (already split)."
+  (setf (viewport-lines viewport) (copy-list lines))
+  (when (> (viewport-y-offset viewport)
+           (viewport-max-y-offset viewport))
+    (viewport-goto-bottom viewport))
+  viewport)
+
 (defun viewport-content (viewport)
   "Get the viewport's full content as a string."
   (format nil "~{~A~^~%~}" (viewport-lines viewport)))
 
 ;;; Helper functions
 
+(defun viewport-display-lines (viewport)
+  "Return the lines actually laid out, one entry per visual row.  With SOFT-WRAP
+enabled, content lines wider than the viewport width are wrapped onto multiple
+visual lines; otherwise the raw content lines are returned unchanged."
+  (let ((lines (viewport-lines viewport)))
+    (if (and (viewport-soft-wrap viewport) lines)
+        (let ((w (max 1 (viewport-width viewport)))
+              (out '()))
+          (dolist (line lines)
+            (if (<= (tuition:visible-length line) w)
+                (push line out)
+                (dolist (seg (tuition:split-string-by-newline
+                              (tuition:wrap-text line w :break-words t
+                                                      :normalize-spaces nil)))
+                  (push seg out))))
+          (nreverse out))
+        lines)))
+
 (defun viewport-max-y-offset (viewport)
-  "Calculate the maximum Y offset."
-  (max 0 (- (length (viewport-lines viewport))
+  "Calculate the maximum Y offset (in visual lines when soft-wrapping)."
+  (max 0 (- (length (viewport-display-lines viewport))
             (viewport-height viewport))))
 
 (defun viewport-longest-line-width (viewport)
@@ -116,30 +151,31 @@
         0)))
 
 (defun viewport-visible-lines-list (viewport)
-  "Get the list of currently visible lines."
-  (let* ((lines (viewport-lines viewport))
+  "Get the list of currently visible lines (visual lines when soft-wrapping)."
+  (let* ((lines (viewport-display-lines viewport))
          (h (viewport-height viewport))
-         (y (viewport-y-offset viewport))
-         (x (viewport-x-offset viewport))
-         (w (viewport-width viewport))
-         (longest (viewport-longest-line-width viewport)))
-
+         (y (viewport-y-offset viewport)))
     (when (and lines (> (length lines) 0))
       (let* ((top (max 0 y))
              (bottom (min (+ y h) (length lines)))
              (visible (subseq lines top bottom)))
-
-        ;; Handle horizontal scrolling if needed
-        (if (and (> longest w) (> x 0))
-            (mapcar (lambda (line)
-                      (let* ((len (tuition:visible-length line))
-                             (start (min x len))
-                             (end (min (+ start w) len)))
-                        (if (>= start len)
-                            ""
-                            (subseq line start end))))
-                    visible)
-            visible)))))
+        (if (viewport-soft-wrap viewport)
+            ;; Soft-wrapped content never scrolls horizontally.
+            visible
+            ;; Handle horizontal scrolling if needed.
+            (let ((x (viewport-x-offset viewport))
+                  (w (viewport-width viewport))
+                  (longest (viewport-longest-line-width viewport)))
+              (if (and (> longest w) (> x 0))
+                  (mapcar (lambda (line)
+                            (let* ((len (tuition:visible-length line))
+                                   (start (min x len))
+                                   (end (min (+ start w) len)))
+                              (if (>= start len)
+                                  ""
+                                  (subseq line start end))))
+                          visible)
+                  visible)))))))
 
 ;;; Status checks
 
@@ -153,8 +189,9 @@
       (viewport-max-y-offset viewport)))
 
 (defun viewport-scroll-percent (viewport)
-  "Get scroll position as a percentage (0.0 to 1.0)."
-  (let ((lines (length (viewport-lines viewport)))
+  "Get scroll position as a percentage (0.0 to 1.0), in visual lines when
+soft-wrapping."
+  (let ((lines (length (viewport-display-lines viewport)))
         (height (viewport-height viewport))
         (offset (viewport-y-offset viewport)))
     (if (>= height lines)
@@ -165,8 +202,12 @@
               (max 0.0 (min 1.0 (/ (float offset) max-offset))))))))
 
 (defun viewport-total-lines (viewport)
-  "Get total number of lines in the viewport."
+  "Get total number of content lines in the viewport (unwrapped)."
   (length (viewport-lines viewport)))
+
+(defun viewport-total-visual-lines (viewport)
+  "Get the total number of visual lines, counting soft-wrapped lines separately."
+  (length (viewport-display-lines viewport)))
 
 (defun viewport-visible-lines (viewport)
   "Get number of currently visible lines."

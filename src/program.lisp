@@ -388,14 +388,21 @@ issues with timed recvmsg on SBCL."
       (run-command program cmd))))
 
 (defun run-sequence (program cmds)
-  "Run multiple commands in sequence."
+  "Run multiple commands in sequence.
+
+An error in one command is reported via HANDLE-ERROR and the sequence
+continues with the next command, rather than silently killing the
+sequence thread (mirrors bubbletea's nested-panic recovery)."
   (bt:make-thread
    (lambda ()
      (dolist (cmd cmds)
        (when (and cmd (program-running program))
-         (let ((msg (funcall cmd)))
-           (when msg
-             (send program msg))))))
+         (handler-case
+             (let ((msg (funcall cmd)))
+               (when msg
+                 (send program msg)))
+           (error (e)
+             (handle-error :command e))))))
    :name "tuition-sequence"))
 
 (defun read-all-available-events ()

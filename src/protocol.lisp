@@ -408,13 +408,23 @@ DOCUMENTATION sets the class docstring (defaults to a short description)."
                             :accessor view-state-disable-bracketed-paste
                             :documentation "When T, disable bracketed paste mode")
    (unicode-mode :initarg :unicode-mode :initform nil :accessor view-state-unicode-mode
-                 :documentation "When T, enable Unicode mode (mode 2027)"))
+                 :documentation "When T, enable Unicode mode (mode 2027)")
+   (progress-bar :initarg :progress-bar :initform nil :accessor view-state-progress-bar
+                 :documentation "Native terminal (taskbar) progress bar as a plist
+(:state <keyword> :value <0-100>), or NIL for none.  See MAKE-PROGRESS-BAR."))
   (:documentation "Declarative view state returned by view methods."))
+
+(defun make-progress-bar (&key (state :default) (value 0))
+  "Describe a native terminal progress bar (OSC 9;4, honoured by Windows
+Terminal, Ghostty, ConEmu, etc.).  STATE is one of :NONE, :DEFAULT, :ERROR,
+:INDETERMINATE, or :WARNING.  VALUE is a percentage 0-100 (ignored for :NONE and
+:INDETERMINATE).  Returns a plist suitable for MAKE-VIEW's :PROGRESS-BAR."
+  (list :state state :value value))
 
 (defun make-view (content &key alt-screen mouse-mode report-focus window-title
                             cursor foreground-color background-color
                             keyboard-enhancements on-mouse
-                            disable-bracketed-paste unicode-mode)
+                            disable-bracketed-paste unicode-mode progress-bar)
   "Create a view-state.  CONTENT is the rendered string."
   (make-instance 'view-state
                  :content content
@@ -428,7 +438,8 @@ DOCUMENTATION sets the class docstring (defaults to a short description)."
                  :keyboard-enhancements keyboard-enhancements
                  :on-mouse on-mouse
                  :disable-bracketed-paste disable-bracketed-paste
-                 :unicode-mode unicode-mode))
+                 :unicode-mode unicode-mode
+                 :progress-bar progress-bar))
 
 (defun view-state-p (obj)
   "Return true if OBJ is a view-state."
@@ -501,11 +512,21 @@ to transition the terminal.  Called by the renderer before content diffing."
   (let ((prev-ke (and prev (view-state-keyboard-enhancements prev)))
         (cur-ke (view-state-keyboard-enhancements current)))
     (when (and (not (equal prev-ke cur-ke)) cur-ke)
-      ;; Push keyboard mode flags
-      ;; Flag 1 = disambiguate escape codes, flag 2 = report event types
+      ;; Push keyboard mode flags (Kitty progressive enhancement):
+      ;;   1  = disambiguate escape codes (always on)
+      ;;   2  = report event types (press/repeat/release)
+      ;;   4  = report alternate keys (shifted / base-layout codepoints)
+      ;;   8  = report all keys as escape codes
+      ;;   16 = report associated text
       (let ((flags 1)) ; always disambiguate
         (when (getf cur-ke :report-event-types)
           (setf flags (logior flags 2)))
+        (when (getf cur-ke :report-alternate-keys)
+          (setf flags (logior flags 4)))
+        (when (getf cur-ke :report-all-keys-as-escapes)
+          (setf flags (logior flags 8)))
+        (when (getf cur-ke :report-associated-text)
+          (setf flags (logior flags 16)))
         (format stream "~C[>~Du" #\Escape flags)))
     (when (and prev-ke (not cur-ke))
       ;; Pop keyboard mode
@@ -528,7 +549,31 @@ to transition the terminal.  Called by the renderer before content diffing."
     (when (and cur-um (not prev-um))
       (format stream "~C[?2027h" #\Escape))
     (when (and prev-um (not cur-um))
-      (format stream "~C[?2027l" #\Escape))))
+      (format stream "~C[?2027l" #\Escape)))
+
+  ;; Native terminal (taskbar) progress bar (OSC 9;4)
+  (let ((prev-pb (and prev (view-state-progress-bar prev)))
+        (cur-pb (view-state-progress-bar current)))
+    (unless (equal prev-pb cur-pb)
+      ;; A removed progress bar (cur-pb NIL) is reset explicitly.
+      (let ((seq (%progress-bar-sequence (or cur-pb '(:state :none)))))
+        (when seq (write-string seq stream))))))
+
+(defun %progress-bar-sequence (pb)
+  "Return the OSC 9;4 escape sequence for progress-bar plist PB, or NIL.
+STATE is one of :NONE, :DEFAULT, :ERROR, :INDETERMINATE, :WARNING; VALUE is a
+percentage clamped to 0-100."
+  (when pb
+    (let ((esc (code-char 27))
+          (bel (code-char 7))
+          (state (or (getf pb :state) :default))
+          (value (max 0 (min 100 (or (getf pb :value) 0)))))
+      (ecase state
+        (:none          (format nil "~C]9;4;0~C" esc bel))
+        (:default       (format nil "~C]9;4;1;~D~C" esc value bel))
+        (:error         (format nil "~C]9;4;2;~D~C" esc value bel))
+        (:indeterminate (format nil "~C]9;4;3~C" esc bel))
+        (:warning       (format nil "~C]9;4;4;~D~C" esc value bel))))))
 
 ;;; ---------- Command utilities ----------
 
