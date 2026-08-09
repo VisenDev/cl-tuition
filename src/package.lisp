@@ -204,6 +204,8 @@
    #:view-state-on-mouse
    #:view-state-disable-bracketed-paste
    #:view-state-unicode-mode
+   #:view-state-progress-bar
+   #:make-progress-bar
    #:cursor
    #:make-cursor
    #:cursor-x
@@ -457,6 +459,7 @@
    #:terminal-operation-error
    #:input-error
    #:*error-handler*
+   #:*panic-log-enabled*
    #:handle-error
 
    ;; Key bindings

@@ -29,6 +29,8 @@
    #:textarea-dynamic-height
    #:textarea-min-height
    #:textarea-max-height
+   #:textarea-max-content-height
+   #:textarea-at-content-limit-p
    #:textarea-line-numbers
 
    ;; Operations
@@ -52,6 +54,8 @@
 
    ;; Cursor operations
    #:textarea-cursor-position
+   #:textarea-line
+   #:textarea-column
    #:textarea-line-count
    #:textarea-length
    #:textarea-move-to-begin
@@ -115,13 +119,19 @@
                :documentation "Minimum viewport height when DYNAMIC-HEIGHT is on")
    (max-height :initarg :max-height :accessor textarea-max-height
                :initform 0
-               :documentation "Maximum viewport height cap when DYNAMIC-HEIGHT is on (0 = no cap)"))
+               :documentation "Maximum viewport height cap when DYNAMIC-HEIGHT is on (0 = no cap)")
+   (max-content-height :initarg :max-content-height :accessor textarea-max-content-height
+                       :initform 0
+                       :documentation "Maximum content height in visual (wrapped) rows.  When
+set (> 0), inserts and newlines are blocked once the content reaches this many
+visual lines (0 = unlimited)."))
   (:documentation "A multi-line text input component."))
 
 (defun make-textarea (&key (width 40) (height 6) (placeholder "")
                         (char-limit 0) (max-lines 1000)
                         (show-line-numbers t) (prompt "> ")
-                        soft-wrap dynamic-height (min-height 1) (max-height 0))
+                        soft-wrap dynamic-height (min-height 1) (max-height 0)
+                        (max-content-height 0))
   "Create a new textarea with the given dimensions."
   (make-instance 'textarea
                  :width width :height height
@@ -129,7 +139,8 @@
                  :show-line-numbers show-line-numbers :prompt prompt
                  :placeholder placeholder
                  :soft-wrap soft-wrap :dynamic-height dynamic-height
-                 :min-height min-height :max-height max-height))
+                 :min-height min-height :max-height max-height
+                 :max-content-height max-content-height))
 
 ;;; Content management
 
@@ -225,6 +236,15 @@
 (defun textarea-cursor-position (textarea)
   "Get cursor position as (row col)."
   (values (textarea-row textarea) (textarea-col textarea)))
+
+(defun textarea-line (textarea)
+  "Return the zero-indexed logical line the cursor is currently on."
+  (textarea-row textarea))
+
+(defun textarea-column (textarea)
+  "Return the zero-indexed column (character offset) of the cursor on its
+current logical line."
+  (textarea-col textarea))
 
 (defun textarea-reset (textarea)
   "Reset the textarea to empty state."
@@ -366,11 +386,14 @@
   textarea)
 
 (defun textarea-newline (textarea)
-  "Insert a newline at cursor position, respecting max-lines."
+  "Insert a newline at cursor position, respecting max-lines and
+max-content-height."
   (let ((max-lines (textarea-max-lines textarea)))
     (when (and (plusp max-lines)
                (>= (textarea-line-count textarea) max-lines))
       (return-from textarea-newline textarea)))
+  (when (textarea-at-content-limit-p textarea)
+    (return-from textarea-newline textarea))
   (let* ((lines (textarea-lines textarea))
          (row (textarea-row textarea))
          (col (textarea-col textarea))
@@ -632,23 +655,58 @@ SOFT-WRAP is off."
       (length (%ta-visual-lines textarea))
       (textarea-line-count textarea)))
 
+(defun textarea-at-content-limit-p (textarea)
+  "True when MAX-CONTENT-HEIGHT is set and the content has reached it (measured
+in visual, wrap-aware rows)."
+  (let ((cap (textarea-max-content-height textarea)))
+    (and (plusp cap)
+         (>= (textarea-visual-line-count textarea) cap))))
+
 ;;; Paging and vertical scroll offset (keep the cursor in view)
 
+(defun %ta-cursor-line-number (textarea)
+  "The cursor's line number in the same units as the scroll offset: the visual
+line index when soft-wrapping, otherwise the logical row."
+  (if (textarea-soft-wrap textarea)
+      (%ta-cursor-visual-index textarea (%ta-visual-lines textarea))
+      (textarea-row textarea)))
+
+(defun %ta-visual-line-row (textarea vi)
+  "The logical row containing visual line index VI (clamped to valid range)."
+  (if (textarea-soft-wrap textarea)
+      (let ((visuals (%ta-visual-lines textarea)))
+        (if (plusp (length visuals))
+            (first (aref visuals (max 0 (min vi (1- (length visuals))))))
+            0))
+      (max 0 (min vi (max 0 (1- (textarea-line-count textarea)))))))
+
+(defun %ta-page-to (textarea target-line)
+  "Move the cursor to visual line TARGET-LINE, preserving the column."
+  (setf (textarea-row textarea) (%ta-visual-line-row textarea target-line))
+  (textarea-set-cursor textarea (textarea-col textarea))
+  textarea)
+
 (defun textarea-page-up (textarea)
-  "Move the cursor up by roughly one viewport height."
-  (let ((delta (max 1 (textarea-height textarea))))
-    (setf (textarea-row textarea)
-          (max 0 (- (textarea-row textarea) delta)))
-    (textarea-set-cursor textarea (textarea-col textarea)))
+  "Move the cursor up by one page.  The first press snaps the cursor to the
+first visible line; subsequent presses move up by a full viewport height."
+  (let* ((h (max 1 (textarea-height textarea)))
+         (yoff (textarea-yoffset textarea))
+         (cur (%ta-cursor-line-number textarea)))
+    (if (> cur yoff)
+        (%ta-page-to textarea yoff)
+        (%ta-page-to textarea (max 0 (- cur h)))))
   textarea)
 
 (defun textarea-page-down (textarea)
-  "Move the cursor down by roughly one viewport height."
-  (let ((delta (max 1 (textarea-height textarea)))
-        (last (1- (textarea-line-count textarea))))
-    (setf (textarea-row textarea)
-          (min (max 0 last) (+ (textarea-row textarea) delta)))
-    (textarea-set-cursor textarea (textarea-col textarea)))
+  "Move the cursor down by one page.  The first press snaps the cursor to the
+last visible line; subsequent presses move down by a full viewport height."
+  (let* ((h (max 1 (textarea-height textarea)))
+         (yoff (textarea-yoffset textarea))
+         (last (max 0 (1- (textarea-visual-line-count textarea))))
+         (cur (%ta-cursor-line-number textarea)))
+    (if (< cur (+ yoff (1- h)))
+        (%ta-page-to textarea (min last (+ yoff (1- h))))
+        (%ta-page-to textarea (min last (+ cur h)))))
   textarea)
 
 (defun textarea-recalculate-height (textarea)
@@ -731,6 +789,13 @@ out of sight regardless of how state was mutated."
       (when (plusp max-lines)
         (let ((allowed (max 0 (- max-lines (textarea-line-count textarea)))))
           (setf s (%ta-truncate-to-newlines s allowed)))))
+    ;; Content-height limit: never grow past MAX-CONTENT-HEIGHT visual rows.
+    ;; Approximated by capping the number of new logical lines the insert adds;
+    ;; exact for the non-wrapping case.
+    (let ((cap (textarea-max-content-height textarea)))
+      (when (plusp cap)
+        (let ((allowed (max 0 (- cap (textarea-visual-line-count textarea)))))
+          (setf s (%ta-truncate-to-newlines s allowed)))))
     s))
 
 ;;; TEA protocol implementation
@@ -766,6 +831,12 @@ place.  Only called when the textarea is focused."
         (alt (tuition:mod-contains (tuition:key-event-mod msg) tuition:+mod-alt+))
         (ctrl (tuition:mod-contains (tuition:key-event-mod msg) tuition:+mod-ctrl+)))
     (cond
+      ;; Word movement (Ctrl+Left / Ctrl+Right) - must precede plain arrows
+      ((and ctrl (eq key :left))
+       (values (textarea-cursor-word-backward textarea) nil))
+      ((and ctrl (eq key :right))
+       (values (textarea-cursor-word-forward textarea) nil))
+
       ;; Arrow navigation
       ((eq key :up)    (values (textarea-cursor-up textarea) nil))
       ((eq key :down)  (values (textarea-cursor-down textarea) nil))
@@ -786,11 +857,13 @@ place.  Only called when the textarea is focused."
       ((and alt (characterp key) (char= key #\f))
        (values (textarea-cursor-word-forward textarea) nil))
 
-      ;; Word deletion (Ctrl+w, Alt+Backspace, Alt+d)
+      ;; Word deletion (Ctrl+w, Ctrl/Alt+Backspace, Ctrl+Delete, Alt+d)
       ((and ctrl (characterp key) (char= key #\w))
        (values (textarea-delete-word-backward textarea) nil))
-      ((and alt (eq key :backspace))
+      ((and (or ctrl alt) (eq key :backspace))
        (values (textarea-delete-word-backward textarea) nil))
+      ((and ctrl (eq key :delete))
+       (values (textarea-delete-word-forward textarea) nil))
       ((and alt (characterp key) (char= key #\d))
        (values (textarea-delete-word-forward textarea) nil))
 

@@ -78,7 +78,7 @@ narrower than a cell's content, the cell soft-wraps onto multiple lines")
   (:documentation "A table for rendering tabular data."))
 
 (defun make-table (&key headers rows border border-style style-func border-row
-                        widths
+                        widths width height
                         (border-top t border-top-p) (border-bottom t border-bottom-p)
                         (border-left t border-left-p) (border-right t border-right-p))
   "Create a new table."
@@ -90,6 +90,8 @@ narrower than a cell's content, the cell soft-wraps onto multiple lines")
     (when style-func (setf (table-style-func tbl) style-func))
     (when border-row (setf (table-border-row tbl) border-row))
     (when widths (setf (table-widths tbl) widths))
+    (when width (setf (table-width tbl) width))
+    (when height (setf (table-height tbl) height))
     (when border-top-p (setf (table-border-top tbl) border-top))
     (when border-bottom-p (setf (table-border-bottom tbl) border-bottom))
     (when border-left-p (setf (table-border-left tbl) border-left))
@@ -108,9 +110,16 @@ narrower than a cell's content, the cell soft-wraps onto multiple lines")
   table)
 
 ;;; Column width calculation
+(defun %cell-string (cell)
+  "Render a cell value as a display string (accepts strings, numbers, etc.)."
+  (cond ((null cell) "")
+        ((stringp cell) cell)
+        (t (princ-to-string cell))))
+
 (defun styled-cell-width (table text row col)
   "Calculate the visible width of a cell after applying its style."
-  (let* ((style-func (table-style-func table))
+  (let* ((text (%cell-string text))
+         (style-func (table-style-func table))
          (styled-text (if style-func
                           (alexandria:if-let (style (funcall style-func row col))
                             (tuition:render-styled style text)
@@ -152,7 +161,8 @@ narrower than a cell's content, the cell soft-wraps onto multiple lines")
   "Return a list of cell lines (each padded to WIDTH), soft-wrapping when the
 styled content is wider than WIDTH.  Ports the wrapping behaviour of lipgloss
 table (#620): a row's height grows to the tallest wrapped cell."
-  (let* ((style-func (table-style-func table))
+  (let* ((text (%cell-string text))
+         (style-func (table-style-func table))
          (styled (if style-func
                      (alexandria:if-let (style (funcall style-func row col))
                        (let ((cell-style (tuition:copy-style style)))
@@ -173,13 +183,91 @@ table (#620): a row's height grows to the tallest wrapped cell."
                     line)))
             lines)))
 
+;;; Width fitting (expand/shrink columns to TABLE-WIDTH)
+(defun %horizontal-border-overhead (table num-cols)
+  "Terminal columns consumed by the left/right borders and column separators."
+  (+ (if (table-border-left table) 1 0)
+     (if (table-border-right table) 1 0)
+     (max 0 (1- num-cols))))
+
+(defun %fit-column-widths (table widths)
+  "Expand or shrink WIDTHS so the rendered table matches TABLE-WIDTH.  Columns
+never shrink below one column unless the width budget makes that impossible
+(ports lipgloss #671).  Returns a fresh list; a no-op when TABLE-WIDTH is unset."
+  (let ((target (table-width table)))
+    (if (or (null target) (<= target 0) (null widths))
+        widths
+        (let* ((num-cols (length widths))
+               (budget (max 0 (- target (%horizontal-border-overhead table num-cols))))
+               (ws (copy-list widths))
+               (total (reduce #'+ ws)))
+          (cond
+            ((= total budget) ws)
+            ;; Expand evenly, distributing any remainder to the leftmost columns.
+            ((< total budget)
+             (let ((extra (- budget total)))
+               (loop for i from 0 while (> extra 0)
+                     do (incf (nth (mod i num-cols) ws))
+                        (decf extra)))
+             ws)
+            ;; Shrink the widest column repeatedly, first respecting a floor of
+            ;; 1, then without a floor if the budget is impossibly small.
+            (t
+             (flet ((shrink (floor)
+                      (loop
+                        (when (<= (reduce #'+ ws) budget) (return))
+                        (let ((widest nil) (wmax floor))
+                          (loop for i below num-cols
+                                when (> (nth i ws) wmax)
+                                  do (setf widest i wmax (nth i ws)))
+                          (if widest (decf (nth widest ws)) (return))))))
+               (shrink 1)
+               (shrink 0))
+             ws))))))
+
+;;; Height fitting (window rows to TABLE-HEIGHT, with an overflow row)
+(defun %row-render-height (table cells row-idx widths)
+  "Rendered height (line count) of a row, accounting for cell soft-wrapping."
+  (let ((line-lists (loop for cell in cells
+                          for col-idx from 0
+                          for w in widths
+                          collect (render-cell-lines table (or cell "") w row-idx col-idx))))
+    (reduce #'max line-lists :key #'length :initial-value 1)))
+
+(defun %visible-row-count (table row-heights header-height)
+  "Return (VALUES COUNT OVERFLOW-P): how many leading data rows fit within
+TABLE-HEIGHT and whether an overflow (ellipsis) row is needed.  When TABLE-HEIGHT
+is unset every row is visible."
+  (let ((target (table-height table)))
+    (if (or (null target) (<= target 0) (null row-heights))
+        (values (length row-heights) nil)
+        (let* ((n (length row-heights))
+               (br (if (table-border-row table) 1 0))
+               (available (+ (- target
+                                (if (table-border-top table) 1 0)
+                                (if (table-border-bottom table) 1 0)
+                                (if (table-headers table) header-height 0)
+                                (if (and (table-headers table) (table-border-header table)) 1 0))
+                             ;; The first data row needs no preceding row border.
+                             br))
+               (count 0))
+          (loop for i below n
+                for row-cost = (+ (nth i row-heights) br)
+                ;; Reserve space for the overflow row when rows remain after i.
+                for reserve = (if (< (1+ i) n) (+ 1 br) 0)
+                do (if (>= (- available row-cost reserve) 0)
+                       (progn (incf count) (decf available row-cost))
+                       (return)))
+          (values count (< count n))))))
+
 ;;; Table rendering
 (defun table-render (table)
   "Render the table to a string."
   (let* ((headers (table-headers table))
          (rows (table-rows table))
          (border (table-border table))
-         (widths (or (table-widths table) (calculate-column-widths table)))
+         (widths (%fit-column-widths
+                  table (or (table-widths table) (calculate-column-widths table))))
          (num-cols (length widths))
          (result nil))
 
@@ -242,16 +330,33 @@ table (#620): a row's height grows to the tallest wrapped cell."
                                 (slot-value border 'tuition::top))
                 result)))
 
-      ;; Data rows
-      (loop for row in rows
-            for row-idx from 0
-            do (when (and (table-border-row table) (> row-idx 0))
-                 (push (render-h-border (slot-value border 'tuition::middle-left)
-                                       (slot-value border 'tuition::middle)
-                                       (slot-value border 'tuition::middle-right)
-                                       (slot-value border 'tuition::top))
-                       result))
-               (push (render-row row row-idx) result))
+      ;; Data rows, windowed to TABLE-HEIGHT with an overflow row when needed.
+      (let* ((row-heights (loop for row in rows
+                                for ri from 0
+                                collect (%row-render-height table row ri widths)))
+             (header-height (if headers
+                                (%row-render-height table headers +header-row+ widths)
+                                0)))
+        (multiple-value-bind (visible-count overflow-p)
+            (%visible-row-count table row-heights header-height)
+          (labels ((row-separator ()
+                     (render-h-border (slot-value border 'tuition::middle-left)
+                                      (slot-value border 'tuition::middle)
+                                      (slot-value border 'tuition::middle-right)
+                                      (slot-value border 'tuition::top))))
+            (loop for row in rows
+                  for row-idx from 0
+                  while (< row-idx visible-count)
+                  do (when (and (table-border-row table) (> row-idx 0))
+                       (push (row-separator) result))
+                     (push (render-row row row-idx) result))
+            ;; Overflow row: a full row of ellipses signalling hidden rows.
+            (when overflow-p
+              (when (and (table-border-row table) (> visible-count 0))
+                (push (row-separator) result))
+              (push (render-row (make-list num-cols :initial-element "…")
+                                visible-count)
+                    result)))))
 
       ;; Bottom border
       (when (table-border-bottom table)

@@ -183,6 +183,13 @@ Modifier is 1-based: 2=Shift, 3=Alt, 4=Shift+Alt, 5=Ctrl, etc."
          (let ((params nil)
                (current-num (digit-char-p ch))
                (sub-params nil)
+               ;; GROUPS preserves the structure lost by the flat SUB-PARAMS
+               ;; list: one entry per ';'-separated parameter, each entry a
+               ;; list of its ':'-separated sub-values.  Needed to tell Kitty
+               ;; alternate-key sub-values (attached to the key param) apart
+               ;; from event-type sub-values (attached to the modifier param).
+               (groups nil)
+               (current-group nil)
                (term nil))
            ;; Read digits, semicolons, colons until we hit a terminator
            (loop for c = (read-char stream nil nil)
@@ -192,22 +199,30 @@ Modifier is 1-based: 2=Shift, 3=Alt, 4=Shift+Alt, 5=Ctrl, etc."
                        (setf current-num (+ (* current-num 10) (digit-char-p c))))
                       ((char= c #\;)
                        (push current-num params)
+                       (push current-num current-group)
+                       (push (nreverse current-group) groups)
+                       (setf current-group nil)
                        (setf current-num 0))
                       ((char= c #\:)
                        ;; Sub-parameter separator (used in Kitty protocol)
                        (push current-num sub-params)
+                       (push current-num current-group)
                        (setf current-num 0))
                       (t
                        (push current-num params)
+                       (push current-num current-group)
+                       (push (nreverse current-group) groups)
                        (setf term c)
                        (return))))
            (setf params (nreverse params))
            (setf sub-params (nreverse sub-params))
-           (%ilog "parse-csi-sequence: params=~A sub-params=~A term='~A'" params sub-params term)
+           (setf groups (nreverse groups))
+           (%ilog "parse-csi-sequence: params=~A sub-params=~A groups=~A term='~A'"
+                  params sub-params groups term)
            (cond
              ;; Kitty keyboard protocol: ESC [ codepoint ; modifiers [: event-type] u
              ((and term (char= term #\u))
-              (parse-kitty-key-sequence params sub-params))
+              (parse-kitty-key-sequence groups))
 
              ;; Modified arrow keys: ESC[1;NA where N is modifier
              ((and term (member term '(#\A #\B #\C #\D #\H #\F))
@@ -248,35 +263,57 @@ Modifier is 1-based: 2=Shift, 3=Alt, 4=Shift+Alt, 5=Ctrl, etc."
 
 ;;; ---------- Kitty keyboard protocol ----------
 
-(defun parse-kitty-key-sequence (params sub-params)
-  "Parse a Kitty keyboard sequence from CSI params.
-Format: CSI codepoint ; modifiers [: event-type] u"
-  (let* ((codepoint (first params))
-         (mod-and-event (if (>= (length params) 2)
-                            (second params)
-                            1))
-         ;; If sub-params has values, they came from the modifier param
-         ;; Format is modifiers:event-type
-         (event-type (cond
-                       ;; Sub-params from : separator within the modifier param
-                       (sub-params (car (last sub-params)))
-                       (t 1))) ; default to press
-         (modifier (if sub-params
-                       (first sub-params)
-                       mod-and-event))
-         ;; Convert Kitty modifier (1-based) to our bitmask
+(defun %kitty-associated-text (text-group codepoint)
+  "Build the key's text from the Kitty associated-text parameter group (flag 16),
+falling back to the base codepoint for printable ASCII."
+  (cond
+    (text-group
+     (map 'string #'code-char
+          (remove-if-not (lambda (cp) (and (integerp cp) (< 0 cp #x110000)))
+                         text-group)))
+    ((< 31 codepoint 127) (string (code-char codepoint)))
+    (t "")))
+
+(defun %kitty-alternate-code (codepoint)
+  "Decode an alternate-key sub-value CODEPOINT (Kitty flag 4) to a key code, or
+NIL when the sub-value is absent or zero."
+  (when (and (integerp codepoint) (plusp codepoint))
+    (%kitty-codepoint-to-key codepoint)))
+
+(defun parse-kitty-key-sequence (groups)
+  "Parse a Kitty keyboard sequence from grouped CSI parameters.
+
+Full format: CSI key[:shifted[:base]] ; modifiers[:event-type] ; text[:...] u
+where GROUPS is a list of parameter groups, each a list of its colon-separated
+sub-values.  Alternate-key sub-values (shifted / base-layout, Kitty flag 4) are
+exposed as the event's SHIFTED-CODE and BASE-CODE; associated text (flag 16)
+becomes the event's TEXT."
+  (let* ((key-group (or (first groups) '(0)))
+         (mod-group (second groups))
+         (text-group (third groups))
+         (codepoint (or (first key-group) 0))
+         ;; (second key-group) = shifted key, (third key-group) = base-layout key.
+         (shifted-code (%kitty-alternate-code (second key-group)))
+         (base-code (%kitty-alternate-code (third key-group)))
+         (modifier (or (first mod-group) 1))
+         (event-type (or (second mod-group) 1)) ; default to press
          (mod (%kitty-modifier-to-mod modifier))
-         ;; Convert codepoint to key code
          (code (%kitty-codepoint-to-key codepoint))
-         (text (if (and (> codepoint 31) (< codepoint 127))
-                   (string (code-char codepoint))
-                   "")))
-    (%ilog "parse-kitty-key: cp=~D mod=~D event=~D -> code=~A" codepoint modifier event-type code)
+         (text (%kitty-associated-text text-group codepoint)))
+    (%ilog "parse-kitty-key: cp=~D mod=~D event=~D shifted=~A base=~A -> code=~A"
+           codepoint modifier event-type shifted-code base-code code)
     (case event-type
-      (1 (make-key-press-msg :code code :mod mod :text text))            ; press
-      (2 (make-key-press-msg :code code :mod mod :text text :repeat-p t)) ; repeat
-      (3 (make-key-release-msg :code code :mod mod :text text))           ; release
-      (otherwise (make-key-press-msg :code code :mod mod :text text)))))
+      ;; press
+      (1 (make-key-press-msg :code code :mod mod :text text
+                             :shifted-code shifted-code :base-code base-code))
+      ;; repeat
+      (2 (make-key-press-msg :code code :mod mod :text text :repeat-p t
+                             :shifted-code shifted-code :base-code base-code))
+      ;; release
+      (3 (make-key-release-msg :code code :mod mod :text text
+                               :shifted-code shifted-code :base-code base-code))
+      (otherwise (make-key-press-msg :code code :mod mod :text text
+                                     :shifted-code shifted-code :base-code base-code)))))
 
 (defun %kitty-modifier-to-mod (modifier)
   "Convert Kitty modifier value (1-based bitmask) to our mod bitmask."

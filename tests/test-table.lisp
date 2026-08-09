@@ -204,3 +204,79 @@
     (let ((view (tuition.render.table:table-render tbl)))
       ;; The full content survives intact on a single line.
       (is (search "abcdefghij" view)))))
+
+;;; --- Height windowing and overflow (lipgloss #620) ---
+
+(defun %tbl-lines (view)
+  (tuition:split-string-by-newline view))
+
+(test table-height-windows-rows-with-overflow
+  "A height smaller than the content shows an ellipsis overflow row and never
+exceeds the requested height."
+  (let ((tbl (tuition.render.table:make-table
+              :headers '("Name" "Role")
+              :rows '(("Alice" "Engineer") ("Bob" "Designer")
+                      ("Carol" "Manager") ("Dave" "Intern"))
+              :height 6)))
+    (let* ((view (tuition.render.table:table-render tbl))
+           (lines (%tbl-lines view)))
+      (is (<= (length lines) 6))
+      ;; An overflow row of ellipses signals hidden rows.
+      (is (some (lambda (l) (search "…" l)) lines))
+      ;; Later rows are not rendered.
+      (is (not (search "Dave" view))))))
+
+(test table-height-large-enough-shows-all
+  "A generous height shows every row and no overflow marker."
+  (let ((tbl (tuition.render.table:make-table
+              :headers '("Name" "Role")
+              :rows '(("Alice" "Engineer") ("Bob" "Designer"))
+              :height 100)))
+    (let ((view (tuition.render.table:table-render tbl)))
+      (is (search "Alice" view))
+      (is (search "Bob" view))
+      (is (not (search "…" view))))))
+
+;;; --- Width fitting (expand/shrink) ---
+
+(test table-width-expands-columns
+  "A width larger than the content expands columns to fill it exactly."
+  (let ((tbl (tuition.render.table:make-table
+              :headers '("A" "B")
+              :rows '(("x" "y"))
+              :width 30)))
+    (let* ((view (tuition.render.table:table-render tbl))
+           (first-line (first (%tbl-lines view))))
+      (is (= 30 (tuition:visible-length first-line))))))
+
+(test table-width-shrinks-columns
+  "A width smaller than the content shrinks columns to fit."
+  (let ((tbl (tuition.render.table:make-table
+              :headers '("Column One" "Column Two")
+              :rows '(("some long content here" "more content"))
+              :width 20)))
+    (let* ((view (tuition.render.table:table-render tbl))
+           (first-line (first (%tbl-lines view))))
+      (is (<= (tuition:visible-length first-line) 20)))))
+
+(test table-width-never-shrinks-to-zero
+  "Even with an impossibly small width, columns keep at least one column and
+the table still renders (lipgloss #671)."
+  (let ((tbl (tuition.render.table:make-table
+              :headers '("AAAA" "BBBB")
+              :rows '(("xxxx" "yyyy"))
+              :width 8)))
+    (let ((view (tuition.render.table:table-render tbl)))
+      ;; Must render without error and keep some content from each column.
+      (is (stringp view))
+      (is (plusp (length view))))))
+
+(test table-accepts-non-string-cells
+  "The render table coerces non-string cells (numbers, symbols) to strings."
+  (let ((tbl (tuition.render.table:make-table
+              :headers '("ID" "Name")
+              :rows '((1 "Alice") (2 "Bob")))))
+    (let ((view (tuition.render.table:table-render tbl)))
+      (is (search "1" view))
+      (is (search "Alice" view))
+      (is (search "2" view)))))
